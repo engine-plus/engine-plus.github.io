@@ -5,14 +5,13 @@
 
 1. PySpark 的多进程架构
 2. Python 端调用 Java、Scala 接口；
-3. Python Driver端 RDD、SQL 接口；
+3. Python Driver 端 RDD、SQL 接口；
 4. Executor 端进程间通信和序列化；
 5. Pandas UDF；
 6. 优化方向；
 
 ## 1、PySpark 的多进程架构
 PySpark 采用了 Python、JVM 进程分离的多进程架构，在 Driver、Executor 端均会同时有 Python、JVM 两个进程。当通过 spark-submit 提交一个 PySpark 的 Python 脚本时，Driver 端会直接运行这个 Python 脚本，并从 Python 中启动 JVM；而在 Python 中调用的 RDD 或者 DataFrame 的操作，会通过 Py4j 调用到 Java 的接口。在 Executor 端恰好是反过来，首先由 Driver 启动了 JVM 的 Executor 进程，然后在 JVM 中去启动 Python 的子进程，用以执行 Python 的 UDF，这其中是使用了 socket 来做进程间通信。总体的架构图如下所示：
-
 
 
 ## 2、Python Driver 如何调用 Java 的接口
@@ -60,4 +59,81 @@ java_import(gateway.jvm, "org.apache.spark.sql.hive.*")
 java_import(gateway.jvm, "scala.Tuple2")
 ```
 
+拿到 JavaGateway 对象，即可以通过它的 jvm 属性，去调用 Java 的类了，例如：
+
+```python
+gateway = JavaGateway()
+jvm = gateway.jvm
+l = jvm.java.util.ArrayList()
+```
+
+然后会继续创建 JVM 中的 SparkContext 对象：
+
+```python
+def _initialize_context(self, jconf):
+    """
+    Initialize SparkContext in function to allow subclass specific initialization
+    """
+    return self._jvm.JavaSparkContext(jconf)
+
+# Create the Java SparkContext through Py4J
+self._jsc = jsc or self._initialize_context(self._conf._jconf)
+```
+
+## Python Driver 端的 RDD、SQL 接口 
+在 PySpark 中，继续初始化一些 Python 和 JVM 的环境后，Python 端的 SparkContext 对象就创建好了，它实际是对 JVM 端接口的一层封装。和 Scala API 类似，SparkContext 对象也提供了各类创建 RDD 的接口，和 Scala API 基本一一对应，我们来看一些例子。
+
+```python
+def newAPIHadoopFile(self, path, inputFormatClass, keyClass, valueClass, keyConverter=None,
+                     valueConverter=None, conf=None, batchSize=0):
+    jconf = self._dictToJavaMap(conf)
+    jrdd = self._jvm.PythonRDD.newAPIHadoopFile(self._jsc, path, inputFormatClass, keyClass,
+                                                valueClass, keyConverter, valueConverter,
+                                                jconf, batchSize)
+    return RDD(jrdd, self)
+```
+
+可以看到，这里 Python 端基本就是直接调用了 Java/Scala 接口。而 PythonRDD (core/src/main/scala/org/apache/spark/api/python/PythonRDD.scala)，则是一个 Scala 中封装的伴生对象，提供了常用的 RDD IO 相关的接口。另外一些接口会通过 self._jsc 对象去创建 RDD。其中 self._jsc 就是 JVM 中的 SparkContext 对象。 拿到 RDD 对象之后，可以像 Scala、Java API 一样，对 RDD 进行各类操作，这些大部分都封装在 python/pyspark/rdd.py 中。
+
+这里的代码中出现了 jrdd 这样一个对象，这实际上是 Scala 为提供 Java 互操作的 RDD 的一个封装，用来提供 Java 的 RDD 接口，具体实现在 core/src/main/scala/org/apache/spark/api/java/JavaRDD.scala 中。可以看到每个 Python 的 RDD 对象需要用一个 JavaRDD 对象去创建。
+
+对于 DataFrame 接口，Python 层也同样提供了 SparkSession、DataFrame 对象，它们也都是对 Java 层接口的封装，这里不一一赘述。
+
+## Executor 端进程间通信和序列化
+
+对于 Spark 内置的算子，在 Python 中调用 RDD、DataFrame 的接口后，从上文可以看出会通过 JVM 去调用到 Scala 的接口，最后执行和直接使用 Scala 并无区别。而对于需要使用 UDF 的情形，在 Executor 端就需要启动一个 Python worker 子进程，然后执行 UDF 的逻辑。Python worker 的启动是由 PythonWorkerFactory 
+
+Executor 端启动 Python 子进程后，会创建一个 socket 与 Python 建立连接。所有 RDD 的数据都要序列化后，通过 socket 发送，而结果数据需要同样的方式序列化传回 JVM。
+
+对于直接使用 RDD 的计算，或者没有开启 spark.sql.execution.arrow.enabled 的 DataFrame，是将输入数据按行发送给 Python，可想而知，这样效率极低。在 Spark 2.2 后提供了基于 Arrow 的序列化、反序列化的机制（从 3.0 起是默认开启），从 JVM 发送数据到 Python 进程的代码在 sql/core/src/main/scala/org/apache/spark/sql/execution/python/ArrowPythonRunner.scala。这个类主要是重写了 newWriterThread 这个方法，使用了 ArrowWriter 向 socket 发送数据：
+
+```scala
+val arrowWriter = ArrowWriter.create(root)
+val writer = new ArrowStreamWriter(root, null, dataOut)
+writer.start()
+
+while (inputIterator.hasNext) {
+val nextBatch = inputIterator.next()
+
+while (nextBatch.hasNext) {
+    arrowWriter.write(nextBatch.next())
+}
+
+arrowWriter.finish()
+writer.writeBatch()
+arrowWriter.reset()
+```
+
+可以看到， 每次取出一个batch，填充给 ArrowWriter，实际数据会保存在 root 对象中，然后由 ArrowStreamWriter 将 root 对象中的整个 batch 的数据写入到 socket 的 DataOutputStream 中去。ArrowStreamWriter 会调用 writeBatch 方法去序列化消息并写数据，代码参考 [ArrowWriter.java#L131](https://github.com/apache/arrow/blob/master/java/vector/src/main/java/org/apache/arrow/vector/ipc/ArrowWriter.java#L131)。
+
+```java
+  protected ArrowBlock writeRecordBatch(ArrowRecordBatch batch) throws IOException {
+    ArrowBlock block = MessageSerializer.serialize(out, batch, option);
+    LOGGER.debug("RecordBatch at {}, metadata: {}, body: {}",
+        block.getOffset(), block.getMetadataLength(), block.getBodyLength());
+    return block;
+  }
+``` 
+
+在 MessageSerializer 中，使用了 [flatbuffer](https://github.com/google/flatbuffers) 来序列化数据。flatbuffer 是一种比较高效的序列化协议，它的主要优点是反序列化的时候，不需要解码，可以直接通过裸 buffer 来读取字段，可以认为反序列化的开销为零。我们来看看 Python 进程收到消息后是如何反序列化的。
 

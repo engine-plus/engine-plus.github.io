@@ -11,7 +11,7 @@
 
 ## 1、PySpark 的多进程架构
 PySpark 采用了 Python、JVM 进程分离的多进程架构，在 Driver、Executor 端均会同时有 Python、JVM 两个进程。当通过 spark-submit 提交一个 PySpark 的 Python 脚本时，Driver 端会直接运行这个 Python 脚本，并从 Python 中启动 JVM；而在 Python 中调用的 RDD 或者 DataFrame 的操作，会通过 Py4j 调用到 Java 的接口。在 Executor 端恰好是反过来，首先由 Driver 启动了 JVM 的 Executor 进程，然后在 JVM 中去启动 Python 的子进程，用以执行 Python 的 UDF，这其中是使用了 socket 来做进程间通信。总体的架构图如下所示：
-
+![PySparkArch](https://raw.githubusercontent.com/engine-plus/engine-plus.github.io/master/pyspark.png)
 
 ## 2、Python Driver 如何调用 Java 的接口
 上面提到，通过 spark-submit 提交 PySpark 作业后，Driver 端首先是运行用户提交的 Python 脚本，然而 Spark 提供的大多数 API 都是 Scala 或者 Java 的，那么就需要能够在 Python 中去调用 Java 接口。这里 PySpark 使用了 Py4j 这个开源库。当创建 Python 端的 SparkContext 对象时，实际会启动 JVM，并创建一个 Scala 端的 SparkContext 对象。代码实现在 python/pyspark/context.py:

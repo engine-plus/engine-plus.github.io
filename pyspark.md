@@ -3,11 +3,12 @@
 众所周知，Spark 框架主要是由 Scala 语言实现，同时也包含少量 Java 代码。Spark 面向用户的编程接口，也是 Scala。然而，在数据科学领域，Python 一直占据比较重要的地位，仍然有大量的数据工程师在使用各类 Python 数据处理和科学计算的库，例如 numpy、Pandas、scikit-learn 等。同时，Python 语言的入门门槛也显著低于 Scala。为此，Spark 推出了 PySpark，在 Spark 框架上提供一套 Python 的接口，方便广大数据科学家使用。
 本文主要从源码实现层面解析 PySpark 的实现原理，包括以下几个方面：
 
-1. PySpark 的多进程架构
+1. PySpark 的多进程架构；
 2. Python 端调用 Java、Scala 接口；
 3. Python Driver 端 RDD、SQL 接口；
 4. Executor 端进程间通信和序列化；
 5. Pandas UDF；
+6. 总结；
 
 ## 1、PySpark 的多进程架构
 PySpark 采用了 Python、JVM 进程分离的多进程架构，在 Driver、Executor 端均会同时有 Python、JVM 两个进程。当通过 spark-submit 提交一个 PySpark 的 Python 脚本时，Driver 端会直接运行这个 Python 脚本，并从 Python 中启动 JVM；而在 Python 中调用的 RDD 或者 DataFrame 的操作，会通过 Py4j 调用到 Java 的接口。在 Executor 端恰好是反过来，首先由 Driver 启动了 JVM 的 Executor 进程，然后在 JVM 中去启动 Python 的子进程，用以执行 Python 的 UDF，这其中是使用了 socket 来做进程间通信。总体的架构图如下所示：
@@ -117,7 +118,7 @@ object PythonEvals extends Strategy {
 
 创建了 ArrowEvalPythonExec 或者 BatchEvalPythonExec，而这二者内部会创建 ArrowPythonRunner、PythonUDFRunner 等类的对象实例，并调用了它们的 compute 方法。由于它们都继承了 BasePythonRunner，基类的 compute 方法中会去启动 Python 子进程：
 ```scala
- def compute(
+def compute(
       inputIterator: Iterator[IN],
       partitionIndex: Int,
       context: TaskContext): Iterator[OUT] = {
@@ -158,12 +159,12 @@ arrowWriter.reset()
 可以看到， 每次取出一个batch，填充给 ArrowWriter，实际数据会保存在 root 对象中，然后由 ArrowStreamWriter 将 root 对象中的整个 batch 的数据写入到 socket 的 DataOutputStream 中去。ArrowStreamWriter 会调用 writeBatch 方法去序列化消息并写数据，代码参考 [ArrowWriter.java#L131](https://github.com/apache/arrow/blob/master/java/vector/src/main/java/org/apache/arrow/vector/ipc/ArrowWriter.java#L131)。
 
 ```java
-  protected ArrowBlock writeRecordBatch(ArrowRecordBatch batch) throws IOException {
-    ArrowBlock block = MessageSerializer.serialize(out, batch, option);
-    LOGGER.debug("RecordBatch at {}, metadata: {}, body: {}",
-        block.getOffset(), block.getMetadataLength(), block.getBodyLength());
-    return block;
-  }
+protected ArrowBlock writeRecordBatch(ArrowRecordBatch batch) throws IOException {
+  ArrowBlock block = MessageSerializer.serialize(out, batch, option);
+  LOGGER.debug("RecordBatch at {}, metadata: {}, body: {}",
+      block.getOffset(), block.getMetadataLength(), block.getBodyLength());
+  return block;
+}
 ``` 
 
 在 MessageSerializer 中，使用了 [flatbuffer](https://github.com/google/flatbuffers) 来序列化数据。flatbuffer 是一种比较高效的序列化协议，它的主要优点是反序列化的时候，不需要解码，可以直接通过裸 buffer 来读取字段，可以认为反序列化的开销为零。我们来看看 Python 进程收到消息后是如何反序列化的。
@@ -240,4 +241,13 @@ df.select(multiply(col("x"), col("x"))).show()
 ```
 上文已经解析过，PySpark 会将 DataFrame 以 Arrow 的方式传递给 Python 进程，Python 中会转换为 Pandas Series，传递给用户的 UDF。在 Pandas UDF 中，可以使用 Pandas 的 API 来完成计算，在易用性和性能上都得到了很大的提升。
 
-同时我们也可以看到，向量化的执行，对提升大规模数据处理的吞吐是非常重要的，一方面可以让数据以向量的形式进行计算，提升 cache 命中率，降低函数调用的开销，另一方面对于一些 IO 的操作，也可以降低网络延迟对性能的影响。
+## 总结
+PySpark 为用户提供了 Python 层对 RDD、DataFrame 的操作接口，同时也支持了 UDF，通过 Arrow、Pandas 向量化的执行，对提升大规模数据处理的吞吐是非常重要的，一方面可以让数据以向量的形式进行计算，提升 cache 命中率，降低函数调用的开销，另一方面对于一些 IO 的操作，也可以降低网络延迟对性能的影响。
+
+然而 PySpark 仍然存在着一些不足，主要有：
+
+1. 进程间通信消耗额外的 CPU 资源；
+2. 编程接口仍然需要理解 Spark 的分布式计算原理；
+3. Pandas UDF 对返回值有一定的限制，返回多列数据不太方便；
+
+Databricks 提出了新的 Koalas 接口来使得用户可以以接近单机版 Pandas 的形式来编写分布式的 Spark 计算作业，对数据科学家会更加友好。而 Vectorized Execution 的推进，有望在 Spark 内部一切数据都是用 Arrow 的格式来存放，对跨语言支持将会更加友好。
